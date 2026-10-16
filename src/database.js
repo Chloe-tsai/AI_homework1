@@ -66,6 +66,24 @@ function initializeDatabase() {
       quantity INTEGER NOT NULL,
       FOREIGN KEY (order_id) REFERENCES orders(id)
     );
+
+    CREATE TABLE IF NOT EXISTS payments (
+      id TEXT PRIMARY KEY,
+      order_id TEXT UNIQUE NOT NULL,
+      provider TEXT NOT NULL DEFAULT 'ecpay' CHECK(provider IN ('ecpay')),
+      merchant_trade_no TEXT UNIQUE NOT NULL,
+      merchant_trade_date TEXT NOT NULL,
+      amount INTEGER NOT NULL CHECK(amount > 0),
+      status TEXT NOT NULL DEFAULT 'created' CHECK(status IN ('created', 'pending', 'paid', 'failed')),
+      provider_trade_no TEXT,
+      payment_type TEXT,
+      paid_at TEXT,
+      last_queried_at TEXT,
+      query_count INTEGER NOT NULL DEFAULT 0 CHECK(query_count >= 0),
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (order_id) REFERENCES orders(id)
+    );
   `);
 
   // Seed data

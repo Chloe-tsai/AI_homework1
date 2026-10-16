@@ -2,6 +2,9 @@
   "name": "backend-project",
   "version": "1.0.0",
   "private": true,
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "npm run css:build && node server.js",
     "dev:server": "node server.js",
