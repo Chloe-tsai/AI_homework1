@@ -116,6 +116,20 @@
             <p class="text-text-secondary">{{ detailOrder.recipient_address }}</p>
           </div>
 
+          <div v-if="detailOrder.payment" class="border-t border-gray-100 pt-4">
+            <p class="text-text-muted mb-2">付款資訊（最新一筆綠界付款）</p>
+            <p class="text-text-primary">
+              {{ { Credit: '信用卡', ATM: 'ATM 轉帳', WebATM: '網路ATM' }[detailOrder.payment.payment_method] || detailOrder.payment.payment_method }}
+              ・{{ { pending: '處理中', paid: '已付款', failed: '失敗' }[detailOrder.payment.status] || detailOrder.payment.status }}
+            </p>
+            <p v-if="detailOrder.payment.v_account" class="text-text-secondary">
+              銀行代碼 {{ detailOrder.payment.bank_code }}・虛擬帳號 {{ detailOrder.payment.v_account }}
+            </p>
+            <p v-if="detailOrder.payment.expire_date" class="text-text-secondary">
+              繳費期限 {{ detailOrder.payment.expire_date }}<span v-if="detailOrder.payment.is_expired" class="text-red-600">（已逾期）</span>
+            </p>
+          </div>
+
           <div class="border-t border-gray-100 pt-4">
             <p class="text-text-muted mb-2">商品明細</p>
             <table class="w-full">

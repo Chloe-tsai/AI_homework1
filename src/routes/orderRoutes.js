@@ -2,6 +2,7 @@ const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const db = require('../database');
 const authMiddleware = require('../middleware/authMiddleware');
+const ecpay = require('../services/ecpay');
 
 const router = express.Router();
 
@@ -285,6 +286,29 @@ router.get('/', (req, res) => {
  *                             type: integer
  *                           quantity:
  *                             type: integer
+ *                     payment:
+ *                       type: object
+ *                       nullable: true
+ *                       description: 最新一筆綠界付款（沒有付款時為 null）
+ *                       properties:
+ *                         payment_method:
+ *                           type: string
+ *                           enum: [Credit, ATM, WebATM]
+ *                         status:
+ *                           type: string
+ *                           enum: [pending, paid, failed]
+ *                         bank_code:
+ *                           type: string
+ *                           nullable: true
+ *                         v_account:
+ *                           type: string
+ *                           nullable: true
+ *                         expire_date:
+ *                           type: string
+ *                           nullable: true
+ *                           description: ATM 繳費期限 yyyy/MM/dd（當天 23:59 台灣時間截止）
+ *                         is_expired:
+ *                           type: boolean
  *                 error:
  *                   type: string
  *                   nullable: true
@@ -301,9 +325,10 @@ router.get('/:id', (req, res) => {
   }
 
   const items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(order.id);
+  const payment = ecpay.summarizePayment(ecpay.getLatestPayment(order.id));
 
   res.json({
-    data: { ...order, items },
+    data: { ...order, items, payment },
     error: null,
     message: '成功'
   });
@@ -413,6 +438,202 @@ router.patch('/:id/pay', (req, res) => {
     error: null,
     message: action === 'success' ? '付款成功' : '付款失敗'
   });
+});
+
+/**
+ * @openapi
+ * /api/orders/{id}/ecpay:
+ *   post:
+ *     summary: 建立綠界 AIO 付款資料（信用卡 / ATM / WebATM）
+ *     description: 回傳綠界付款頁網址與已簽章（CheckMacValue）的表單參數，前端以 form POST 全頁導向綠界。每次呼叫都會產生新的 MerchantTradeNo。ATM 另帶 ExpireDate、PaymentInfoURL、ClientRedirectURL，不帶 OrderResultURL。訂單仍有未到期的 ATM 繳費帳號時回 409。
+ *     tags: [Orders]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: false
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               paymentMethod:
+ *                 type: string
+ *                 enum: [Credit, ATM, WebATM]
+ *                 default: Credit
+ *     responses:
+ *       200:
+ *         description: 已建立綠界付款資料
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 data:
+ *                   type: object
+ *                   properties:
+ *                     action_url:
+ *                       type: string
+ *                     merchant_trade_no:
+ *                       type: string
+ *                     params:
+ *                       type: object
+ *                       description: 綠界 AIO 表單欄位（PascalCase，依綠界規格）
+ *                 error:
+ *                   type: string
+ *                   nullable: true
+ *                 message:
+ *                   type: string
+ *       400:
+ *         description: 訂單狀態不是 pending，或 paymentMethod 不是 Credit / ATM / WebATM
+ *       404:
+ *         description: 訂單不存在
+ *       409:
+ *         description: 此訂單已有尚未到期的 ATM 繳費帳號
+ */
+router.post('/:id/ecpay', (req, res) => {
+  const order = db.prepare('SELECT * FROM orders WHERE id = ? AND user_id = ?').get(req.params.id, req.user.userId);
+  if (!order) {
+    return res.status(404).json({ data: null, error: 'NOT_FOUND', message: '訂單不存在' });
+  }
+
+  if (order.status !== 'pending') {
+    return res.status(400).json({
+      data: null,
+      error: 'INVALID_STATUS',
+      message: '訂單狀態不是 pending，無法付款'
+    });
+  }
+
+  const paymentMethod = req.body && req.body.paymentMethod !== undefined ? req.body.paymentMethod : 'Credit';
+  if (!ecpay.PAYMENT_METHODS.includes(paymentMethod)) {
+    return res.status(400).json({
+      data: null,
+      error: 'VALIDATION_ERROR',
+      message: 'paymentMethod 必須為 Credit、ATM 或 WebATM'
+    });
+  }
+
+  // An unexpired ATM account may still receive a transfer; ATM payments cannot be refunded by API
+  if (ecpay.isAtmActive(ecpay.getLatestPayment(order.id))) {
+    return res.status(409).json({
+      data: null,
+      error: 'CONFLICT',
+      message: '此訂單已有尚未到期的 ATM 繳費帳號，請完成轉帳或待期限過後再改用其他方式'
+    });
+  }
+
+  const items = db.prepare('SELECT product_name, quantity FROM order_items WHERE order_id = ?').all(order.id);
+  const merchantTradeNo = ecpay.generateMerchantTradeNo();
+  const { actionUrl, params } = ecpay.buildCheckoutParams(order, items, merchantTradeNo, paymentMethod);
+
+  db.prepare(
+    'INSERT INTO payments (id, order_id, merchant_trade_no, amount, payment_method) VALUES (?, ?, ?, ?, ?)'
+  ).run(uuidv4(), order.id, merchantTradeNo, order.total_amount, paymentMethod);
+
+  res.json({
+    data: { action_url: actionUrl, merchant_trade_no: merchantTradeNo, params },
+    error: null,
+    message: '已建立綠界付款資料'
+  });
+});
+
+/**
+ * @openapi
+ * /api/orders/{id}/ecpay/query:
+ *   post:
+ *     summary: 向綠界查詢付款狀態並同步訂單
+ *     description: 以最近一筆未完成的付款紀錄呼叫綠界 QueryTradeInfo；TradeStatus=1 時將訂單更新為 paid。若該筆是尚未取得帳號的 ATM 付款，會先呼叫 QueryPaymentInfo 補上虛擬帳號。回傳格式同訂單詳情（含 payment）。
+ *     tags: [Orders]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: 成功（data 為訂單詳情含 items）
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 data:
+ *                   type: object
+ *                 error:
+ *                   type: string
+ *                   nullable: true
+ *                 message:
+ *                   type: string
+ *       404:
+ *         description: 訂單不存在
+ *       502:
+ *         description: 無法連線綠界查詢付款狀態
+ */
+router.post('/:id/ecpay/query', async (req, res, next) => {
+  try {
+    const order = db.prepare('SELECT * FROM orders WHERE id = ? AND user_id = ?').get(req.params.id, req.user.userId);
+    if (!order) {
+      return res.status(404).json({ data: null, error: 'NOT_FOUND', message: '訂單不存在' });
+    }
+
+    if (order.status === 'pending') {
+      const payment = db.prepare(
+        "SELECT * FROM payments WHERE order_id = ? AND status = 'pending' ORDER BY created_at DESC, rowid DESC LIMIT 1"
+      ).get(order.id);
+
+      if (payment && payment.payment_method === 'ATM' && !payment.v_account) {
+        // Browser never came back and PaymentInfoURL unreachable (e.g. localhost): pull the account info
+        try {
+          const info = await ecpay.queryPaymentInfo(payment.merchant_trade_no);
+          if (String(info.RtnCode) === '2') {
+            ecpay.saveAtmInfo({
+              merchantTradeNo: info.MerchantTradeNo,
+              tradeNo: info.TradeNo,
+              bankCode: info.BankCode,
+              vAccount: info.vAccount,
+              expireDate: info.ExpireDate
+            });
+          }
+        } catch (err) {
+          // Not fatal: the shopper may not have picked a bank yet; still check the trade status below
+          console.error('ECPay QueryPaymentInfo failed:', err.message);
+        }
+      }
+
+      if (payment) {
+        try {
+          await ecpay.confirmPayment(payment.merchant_trade_no);
+        } catch (err) {
+          console.error('ECPay query failed:', err.message);
+          return res.status(502).json({
+            data: null,
+            error: 'PAYMENT_GATEWAY_ERROR',
+            message: '無法連線綠界查詢付款狀態'
+          });
+        }
+      }
+    }
+
+    const updated = db.prepare('SELECT * FROM orders WHERE id = ?').get(order.id);
+    const items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(order.id);
+
+    res.json({
+      data: { ...updated, items, payment: ecpay.summarizePayment(ecpay.getLatestPayment(order.id)) },
+      error: null,
+      message: updated.status === 'paid' ? '付款成功' : '尚未完成付款'
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 module.exports = router;

@@ -66,11 +66,49 @@ function initializeDatabase() {
       quantity INTEGER NOT NULL,
       FOREIGN KEY (order_id) REFERENCES orders(id)
     );
+
+    CREATE TABLE IF NOT EXISTS payments (
+      id TEXT PRIMARY KEY,
+      order_id TEXT NOT NULL,
+      merchant_trade_no TEXT UNIQUE NOT NULL,
+      amount INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'paid', 'failed')),
+      trade_no TEXT,
+      payment_type TEXT,
+      rtn_code TEXT,
+      rtn_msg TEXT,
+      paid_at TEXT,
+      simulate_paid INTEGER,
+      payment_method TEXT NOT NULL DEFAULT 'Credit',
+      bank_code TEXT,
+      v_account TEXT,
+      expire_date TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (order_id) REFERENCES orders(id)
+    );
   `);
+
+  migratePaymentsColumns();
 
   // Seed data
   seedAdminUser();
   seedProducts();
+}
+
+// Idempotent upgrade for databases created before ATM support
+function migratePaymentsColumns() {
+  const existing = new Set(db.prepare('PRAGMA table_info(payments)').all().map(c => c.name));
+  const columns = [
+    ['payment_method', "TEXT NOT NULL DEFAULT 'Credit'"],
+    ['bank_code', 'TEXT'],
+    ['v_account', 'TEXT'],
+    ['expire_date', 'TEXT']
+  ];
+  for (const [name, definition] of columns) {
+    if (!existing.has(name)) {
+      db.exec(`ALTER TABLE payments ADD COLUMN ${name} ${definition}`);
+    }
+  }
 }
 
 function seedAdminUser() {

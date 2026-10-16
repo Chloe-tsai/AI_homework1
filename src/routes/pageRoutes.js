@@ -51,7 +51,8 @@ router.get('/orders/:id', function (req, res) {
     title: '訂單詳情',
     pageScript: 'order-detail',
     orderId: req.params.id,
-    paymentResult: req.query.payment || ''
+    paymentResult: req.query.payment || '',
+    ecpayEnv: process.env.ECPAY_ENV || 'staging'
   });
 });
 

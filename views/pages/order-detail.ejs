@@ -1,4 +1,4 @@
-<div id="app" data-order-id="<%= orderId %>" data-payment-result="<%= paymentResult %>">
+<div id="app" data-order-id="<%= orderId %>" data-payment-result="<%= paymentResult %>" data-ecpay-env="<%= ecpayEnv %>">
   <h1 class="text-2xl font-bold text-text-primary mb-6" style="font-family: 'Noto Serif TC', serif;">訂單詳情</h1>
 
   <div v-if="loading" class="flex justify-center py-12">
@@ -70,22 +70,80 @@
       </table>
     </div>
 
-    <!-- Payment Buttons -->
-    <div v-if="order.status === 'pending'" class="flex gap-4">
-      <button
-        @click="handlePaySuccess"
-        :disabled="paying"
-        class="bg-sage text-white px-8 py-3 rounded-full text-sm font-medium hover:bg-sage/90 transition-colors disabled:opacity-50"
-      >
-        {{ paying ? '處理中...' : '付款成功' }}
-      </button>
-      <button
-        @click="handlePayFail"
-        :disabled="paying"
-        class="bg-red-500 text-white px-8 py-3 rounded-full text-sm font-medium hover:bg-red-600 transition-colors disabled:opacity-50"
-      >
-        {{ paying ? '處理中...' : '付款失敗' }}
-      </button>
+    <!-- Payment (ECPay) -->
+    <div v-if="order.status === 'pending'" class="bg-white rounded-2xl shadow-sm p-6">
+      <!-- ATM account issued and still valid: show transfer info instead of payment buttons -->
+      <template v-if="atmActive">
+        <h2 class="font-medium text-text-primary mb-3">ATM 繳費資訊</h2>
+        <p class="text-sm text-text-secondary mb-4">請於繳費期限內，以 ATM 或網路銀行轉帳至下列虛擬帳號。轉帳完成後訂單會自動更新為「已付款」。</p>
+        <dl class="grid grid-cols-[6rem_1fr] gap-y-2 text-sm mb-4">
+          <dt class="text-text-muted">銀行代碼</dt>
+          <dd class="text-text-primary font-medium">{{ order.payment.bank_code }}</dd>
+          <dt class="text-text-muted">虛擬帳號</dt>
+          <dd class="flex items-center gap-3">
+            <span class="text-text-primary font-medium tracking-wider">{{ order.payment.v_account }}</span>
+            <button @click="copyAccount" class="text-xs text-rose-primary underline hover:text-rose-dark">複製</button>
+          </dd>
+          <dt class="text-text-muted">轉帳金額</dt>
+          <dd class="text-rose-primary font-bold">NT$ {{ order.total_amount.toLocaleString() }}</dd>
+          <dt class="text-text-muted">繳費期限</dt>
+          <dd class="text-text-primary">{{ order.payment.expire_date }} 23:59 前</dd>
+        </dl>
+        <button
+          @click="refreshPaymentStatus(false)"
+          :disabled="checking"
+          class="bg-rose-primary text-white px-6 py-2.5 rounded-full text-sm font-medium hover:bg-rose-dark transition-colors disabled:opacity-50"
+        >
+          {{ checking ? '查詢中...' : '已轉帳？重新查詢付款狀態' }}
+        </button>
+        <p v-if="!isProduction" class="text-xs text-text-muted mt-4">
+          測試環境：無法真的轉帳，請至綠界測試後台（vendor-stage.ecpay.com.tw，帳號 stagetest3 / test1234）對此訂單「模擬付款」；BASE_URL 需為公開網址（例如 ngrok）才收得到通知。
+        </p>
+      </template>
+
+      <template v-else>
+        <h2 class="font-medium text-text-primary mb-3">付款</h2>
+        <p v-if="order.payment && order.payment.payment_method === 'ATM' && order.payment.is_expired" class="text-sm text-red-600 mb-3">
+          先前的 ATM 繳費帳號已超過繳費期限，請重新選擇付款方式。
+        </p>
+        <p class="text-sm text-text-secondary mb-4">請選擇付款方式，將前往綠界科技（ECPay）安全付款頁面。</p>
+        <div class="flex flex-wrap items-center gap-4">
+          <button
+            @click="payWithEcpay('Credit')"
+            :disabled="paying"
+            class="bg-rose-primary text-white px-8 py-3 rounded-full text-sm font-medium hover:bg-rose-dark transition-colors disabled:opacity-50"
+          >
+            {{ paying === 'Credit' ? '前往綠界中...' : '信用卡付款' }}
+          </button>
+          <button
+            @click="payWithEcpay('ATM')"
+            :disabled="paying"
+            class="border border-rose-primary text-rose-primary px-8 py-3 rounded-full text-sm font-medium hover:bg-rose-light transition-colors disabled:opacity-50"
+          >
+            {{ paying === 'ATM' ? '前往綠界中...' : 'ATM 轉帳' }}
+          </button>
+          <button
+            @click="payWithEcpay('WebATM')"
+            :disabled="paying || isMobile"
+            class="border border-rose-primary text-rose-primary px-8 py-3 rounded-full text-sm font-medium hover:bg-rose-light transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {{ paying === 'WebATM' ? '前往綠界中...' : 'WebATM（網路ATM）' }}
+          </button>
+          <button
+            @click="refreshPaymentStatus(false)"
+            :disabled="checking"
+            class="text-sm text-text-secondary underline hover:text-rose-primary disabled:opacity-50"
+          >
+            {{ checking ? '查詢中...' : '重新查詢付款狀態' }}
+          </button>
+        </div>
+        <p class="text-xs mt-3" :class="isMobile ? 'text-red-600' : 'text-text-muted'">
+          {{ isMobile ? 'WebATM 不支援手機，請改用電腦或其他付款方式。' : 'WebATM 需使用電腦、晶片金融卡與讀卡機，於銀行網路 ATM 即時轉帳。' }}
+        </p>
+        <p v-if="!isProduction" class="text-xs text-text-muted mt-4">
+          測試環境：信用卡卡號 4311-9522-2222-2222，有效期限任意未來日期，安全碼任意三碼，3D 驗證碼 1234。ATM 取號後可在綠界測試後台模擬付款。
+        </p>
+      </template>
     </div>
   </template>
 </div>

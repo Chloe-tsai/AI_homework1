@@ -16,6 +16,7 @@
 │ static(public) → cors → json → urlencoded → sessionMiddleware      │
 │ /api/auth  /api/admin/products  /api/admin/orders                  │
 │ /api/products  /api/cart  /api/orders     ← src/routes/*.js        │
+│ /  (ecpayRoutes: /api/ecpay/notify、/ecpay/result ← 綠界回呼)        │
 │ /  (pageRoutes: 只 render，無資料、無權限檢查)                       │
 │ 404 handler → errorHandler                                         │
 └──────────────────────────────┬─────────────────────────────────────┘
@@ -26,8 +27,8 @@
 
 重點：
 - **伺服器端頁面不帶任何業務資料**。EJS 只輸出版型與 Vue 模板（`{{ }}`、`v-if` 等由瀏覽器端 Vue 解析），資料一律由前端呼叫 `/api/*` 取得。少數需要的參數（商品 id、訂單 id、付款結果）透過 `#app` 的 `data-*` 屬性傳給前端。
-- **單一程序、單一檔案資料庫**：沒有 ORM、沒有 migration 工具、沒有 service/repository 層，SQL 直接寫在路由處理器內。
-- **同步 I/O**：better-sqlite3 為同步 API，所有路由處理器都是同步函式；處理器內拋出的例外會被 Express 4 捕捉並送到 `errorHandler`。
+- **單一程序、單一檔案資料庫**：沒有 ORM、沒有 migration 工具、沒有 repository 層，SQL 直接寫在路由處理器內。唯一的 service 是 `src/services/ecpay.js`（綠界簽章、查詢與付款狀態更新），因為它被 3 支路由共用。
+- **同步 DB、少數 async 處理器**：better-sqlite3 為同步 API，絕大多數路由處理器是同步函式，處理器內拋出的例外會被 Express 4 捕捉並送到 `errorHandler`。只有需要對外呼叫綠界的 3 個處理器是 async（`POST /api/orders/:id/ecpay/query`、`POST /api/ecpay/notify`、`POST /ecpay/result`）——Express 4 **不會**接住 rejected promise，所以它們以 try/catch 或 `ecpayRoutes.js` 內的 `asyncHandler` 把錯誤交給 `next(err)`。
 
 ---
 
@@ -39,13 +40,19 @@
 ├── server.js                   # 進入點：只在直接執行時檢查 JWT_SECRET 並 listen(PORT || 3001)；被 require 時只 export app
 ├── generate-openapi.js         # 用 swagger-jsdoc + swagger-config 產生 openapi.json（寫到「執行時的 cwd」）
 ├── swagger-config.js           # OpenAPI 3.0.3 定義：info、servers、securitySchemes(bearerAuth / sessionId)、apis: ./src/routes/*.js
-├── vitest.config.js            # Vitest 設定（ESM 語法）：globals、串行執行、測試檔順序、hookTimeout 10s
+├── vitest.config.js            # Vitest 設定（ESM 語法）：globals、串行執行（fileParallelism: false）、hookTimeout 10s；其中 sequence.files 不是有效選項、被忽略（且未列 ecpay.test.js）
 ├── package.json                # scripts 與依賴（無 "type" 欄位 → CommonJS）
 ├── package-lock.json
-├── .env.example                # 環境變數範本（JWT、URL、Admin seed、ECPay 預留）
-├── .gitignore                  # 忽略 node_modules、*.sqlite*、.env、public/css/output.css 等
+├── .env.example                # 環境變數範本（JWT、BASE_URL、Admin seed、ECPay 公開測試帳號與回呼網址說明）
+├── .env                        # 實際環境變數（gitignore；測試也會讀取）
+├── .gitignore                  # 忽略 node_modules、*.sqlite*、.env、public/css/output.css 等（另有無作用的舊路徑 backend-project/...）
 ├── database.sqlite(-shm/-wal)  # 執行時產生的 SQLite 檔（gitignore）
-├── openapi.json                # `npm run openapi` 產物（未納入版控）
+├── openapi.json                # `npm run openapi` 產物；⚠ 未列入 .gitignore，提交前自行排除
+├── AGENTS.md                   # 專案入口文件（概述、指令、關鍵規則、@docs 引用）；給所有 AI 助手與新成員
+├── CLAUDE.md                   # 只含 `@AGENTS.md`，讓 Claude Code 載入同一份內容
+├── .claude/
+│   ├── settings.json           # Claude Code 專案設定
+│   └── skills/ecpay/           # 綠界官方整合 skill（guides、references、test-vectors）；金流實作與測試向量的依據
 │
 ├── src/
 │   ├── database.js             # 開啟 DB、設定 pragma、CREATE TABLE IF NOT EXISTS、seed admin 與商品；module.exports = db（單例）
@@ -54,14 +61,17 @@
 │   │   ├── adminMiddleware.js  # 檢查 req.user.role === 'admin'，否則 403
 │   │   ├── sessionMiddleware.js# 讀 X-Session-Id header → req.sessionId（全域掛載）
 │   │   └── errorHandler.js     # 最後一道錯誤處理：記 log、遮蔽 500 訊息、回統一格式
-│   └── routes/
-│       ├── authRoutes.js       # /api/auth：register、login、profile
-│       ├── productRoutes.js    # /api/products：公開商品列表（分頁）與詳情
-│       ├── cartRoutes.js       # /api/cart：購物車 CRUD；內含 dualAuth 與 getOwnerCondition
-│       ├── orderRoutes.js      # /api/orders：建立訂單（transaction）、列表、詳情、模擬付款；內含 generateOrderNo
-│       ├── adminProductRoutes.js # /api/admin/products：後台商品 CRUD
-│       ├── adminOrderRoutes.js # /api/admin/orders：後台訂單列表（狀態篩選）與詳情
-│       └── pageRoutes.js       # / 下的頁面路由；renderFront / renderAdmin 兩段式 render
+│   ├── routes/
+│   │   ├── authRoutes.js       # /api/auth：register、login、profile
+│   │   ├── productRoutes.js    # /api/products：公開商品列表（分頁）與詳情
+│   │   ├── cartRoutes.js       # /api/cart：購物車 CRUD；內含 dualAuth 與 getOwnerCondition
+│   │   ├── orderRoutes.js      # /api/orders：建立訂單（transaction）、列表、詳情、模擬付款、綠界付款建立與查詢；內含 generateOrderNo
+│   │   ├── adminProductRoutes.js # /api/admin/products：後台商品 CRUD
+│   │   ├── adminOrderRoutes.js # /api/admin/orders：後台訂單列表（狀態篩選）與詳情
+│   │   ├── ecpayRoutes.js      # 綠界回呼：/api/ecpay/notify（ReturnURL）、/api/ecpay/payment-info（ATM PaymentInfoURL）、/ecpay/result（OrderResultURL）、/ecpay/payment-info-result（ATM ClientRedirectURL）；掛在 /
+│   │   └── pageRoutes.js       # / 下的頁面路由；renderFront / renderAdmin 兩段式 render
+│   └── services/
+│       └── ecpay.js            # 綠界 AIO：CheckMacValue 產生/驗證、建單參數、queryTradeInfo、confirmPayment（唯一能標記已付款的路徑）、applyPaymentResult（冪等更新）
 │
 ├── views/
 │   ├── layouts/
@@ -81,7 +91,7 @@
 │       ├── checkout.ejs        # 收件資訊表單 + 訂單摘要
 │       ├── login.ejs           # 登入 / 註冊 雙分頁表單
 │       ├── orders.ejs          # 我的訂單列表
-│       ├── order-detail.ejs    # 訂單詳情 + 付款結果提示 + 模擬付款按鈕；#app data-order-id / data-payment-result
+│       ├── order-detail.ejs    # 訂單詳情 + 付款結果提示 +「信用卡付款」/「ATM 轉帳」/「WebATM（網路ATM）」（手機停用）/「重新查詢付款狀態」+ ATM 繳費資訊卡片（銀行代碼、虛擬帳號可複製、期限）+ 非 production 測試提示；#app data-order-id / data-payment-result / data-ecpay-env
 │       ├── 404.ejs             # 找不到頁面
 │       └── admin/
 │           ├── products.ejs    # 商品表格 + 新增/編輯 modal + 刪除確認
@@ -104,10 +114,12 @@
 │
 ├── tests/
 │   ├── setup.js                # 匯出 app、request、getAdminToken()、registerUser()
-│   └── auth / products / cart / orders / adminProducts / adminOrders .test.js
+│   └── auth / products / cart / orders / adminProducts / adminOrders / ecpay / ecpayAtm .test.js
 │
 └── docs/                       # 專案文件（本目錄）
-    └── plans/ → archive/
+    ├── README.md  ARCHITECTURE.md  DEVELOPMENT.md  FEATURES.md  TESTING.md  CHANGELOG.md
+    └── plans/                  # 進行中的計畫（YYYY-MM-DD-<feature>.md）
+        └── archive/            # 已完成計畫（例：2026-10-15-ecpay-integration.md）
 ```
 
 ---
@@ -121,9 +133,10 @@
 3. `require('./src/database')`（模組載入即執行）：
    1. `new Database(<專案根>/database.sqlite)`（路徑以 `src/` 的上一層計算，與 cwd 無關）
    2. `PRAGMA journal_mode = WAL`、`PRAGMA foreign_keys = ON`
-   3. `CREATE TABLE IF NOT EXISTS` 五張表（**既有表不會被修改**；改 schema 需自行處理，見 DEVELOPMENT.md）
-   4. `seedAdminUser()`：若 `ADMIN_EMAIL` 不存在則建立 admin（bcrypt rounds：`NODE_ENV === 'test'` 時 1，否則 10）
-   5. `seedProducts()`：`products` 表為空時才以 transaction 寫入 8 筆商品
+   3. `CREATE TABLE IF NOT EXISTS` 六張表（含 `payments`）（**既有表不會被修改**；改 schema 需自行處理，見 DEVELOPMENT.md）
+   4. `migratePaymentsColumns()`：以 `PRAGMA table_info(payments)` 檢查，為加入 ATM 前建立的資料庫補上 `payment_method`、`bank_code`、`v_account`、`expire_date`（冪等）
+   5. `seedAdminUser()`：若 `ADMIN_EMAIL` 不存在則建立 admin（bcrypt rounds：`NODE_ENV === 'test'` 時 1，否則 10）
+   6. `seedProducts()`：`products` 表為空時才以 transaction 寫入 8 筆商品
 4. 建立 Express app，依序註冊：
    1. `view engine = ejs`、`views = ./views`
    2. `express.static('public')` — **在所有 API 之前**，`public/` 下同名路徑會優先回傳靜態檔
@@ -131,7 +144,8 @@
    4. `express.json()`、`express.urlencoded({ extended: false })`
    5. `sessionMiddleware`（全域）
    6. API 路由（順序：auth → admin/products → admin/orders → products → cart → orders）
-   7. `pageRoutes`（掛在 `/`）
+   7. `ecpayRoutes`（掛在 `/`，提供 `POST /api/ecpay/notify`、`/api/ecpay/payment-info`、`/ecpay/result`、`/ecpay/payment-info-result`；必須在 pageRoutes 與 404 之前）
+   8. `pageRoutes`（掛在 `/`）
    8. 404 handler：`/api` 開頭回 JSON `NOT_FOUND`，其他 render `pages/404` 包在 front layout
    9. `errorHandler`
 5. `server.js` 判斷 `require.main === module`（直接執行）時：
@@ -158,7 +172,13 @@
 | POST | `/api/orders` | `orderRoutes.js` | JWT（router 層） | 由會員購物車建立訂單（201） |
 | GET | `/api/orders` | `orderRoutes.js` | JWT | 我的訂單列表（不分頁） |
 | GET | `/api/orders/:id` | `orderRoutes.js` | JWT | 我的訂單詳情（含 items） |
-| PATCH | `/api/orders/:id/pay` | `orderRoutes.js` | JWT | 模擬付款 `action: success/fail` |
+| PATCH | `/api/orders/:id/pay` | `orderRoutes.js` | JWT | 模擬付款 `action: success/fail`（前端已改用綠界，保留供測試） |
+| POST | `/api/orders/:id/ecpay` | `orderRoutes.js` | JWT | 建立綠界 AIO 付款資料（新 `payments` 列 + 已簽章表單參數） |
+| POST | `/api/orders/:id/ecpay/query` | `orderRoutes.js` | JWT | 向綠界 QueryTradeInfo 查詢並同步訂單狀態 |
+| POST | `/api/ecpay/notify` | `ecpayRoutes.js` | 無（CheckMacValue） | 綠界 ReturnURL；純文字 `1\|OK`，或 `0\|CheckMacValue Error` / `0\|Not Paid Yet` / `0\|QueryTradeInfo Error`（HTTP 皆 200） |
+| POST | `/ecpay/result` | `ecpayRoutes.js` | 無（CheckMacValue） | 綠界 OrderResultURL（瀏覽器帶回）；302 至 `/orders/:id?payment=success\|failed\|pending`，簽章錯或查無付款至 `/orders?payment=failed` |
+| POST | `/api/ecpay/payment-info` | `ecpayRoutes.js` | 無（CheckMacValue） | 綠界 ATM 取號通知 PaymentInfoURL；`RtnCode=2` 寫入虛擬帳號；純文字 `1\|OK` |
+| POST | `/ecpay/payment-info-result` | `ecpayRoutes.js` | 無（CheckMacValue） | 綠界 ATM 取號後瀏覽器導回 ClientRedirectURL；302 至 `/orders/:id?payment=atm\|failed` |
 | GET | `/api/admin/products` | `adminProductRoutes.js` | JWT + admin（router 層） | 後台商品列表（分頁） |
 | POST | `/api/admin/products` | `adminProductRoutes.js` | JWT + admin | 新增商品（201） |
 | PUT | `/api/admin/products/:id` | `adminProductRoutes.js` | JWT + admin | 部分更新商品 |
@@ -171,14 +191,14 @@
 | 路徑 | 版型 | 頁面模板 | pageScript | 額外 locals |
 |------|------|----------|-----------|-------------|
 | `/` | front | `pages/index` | `index` | `title: '首頁'` |
-| `/products/:id` | front | `pages/product-detail` | `product-detail` | `productId` |
-| `/cart` | front | `pages/cart` | `cart` | — |
-| `/checkout` | front | `pages/checkout` | `checkout` | — |
-| `/login` | front | `pages/login` | `login` | — |
-| `/orders` | front | `pages/orders` | `orders` | — |
-| `/orders/:id` | front | `pages/order-detail` | `order-detail` | `orderId`、`paymentResult`（= `req.query.payment \|\| ''`） |
-| `/admin/products` | admin | `pages/admin/products` | `admin-products` | `currentPath` |
-| `/admin/orders` | admin | `pages/admin/orders` | `admin-orders` | `currentPath` |
+| `/products/:id` | front | `pages/product-detail` | `product-detail` | `title: '商品詳情'`、`productId` |
+| `/cart` | front | `pages/cart` | `cart` | `title: '購物車'` |
+| `/checkout` | front | `pages/checkout` | `checkout` | `title: '結帳'` |
+| `/login` | front | `pages/login` | `login` | `title: '登入'` |
+| `/orders` | front | `pages/orders` | `orders` | `title: '我的訂單'` |
+| `/orders/:id` | front | `pages/order-detail` | `order-detail` | `title: '訂單詳情'`、`orderId`、`paymentResult`（= `req.query.payment \|\| ''`）、`ecpayEnv`（= `ECPAY_ENV \|\| 'staging'`） |
+| `/admin/products` | admin | `pages/admin/products` | `admin-products` | `title: '商品管理'`、`currentPath` |
+| `/admin/orders` | admin | `pages/admin/orders` | `admin-orders` | `title: '訂單管理'`、`currentPath` |
 
 **兩段式 render**：`renderFront/renderAdmin` 先 render 頁面模板取得 HTML 字串 `body`，再 render layout 並以 `<%- body %>` 插入。EJS 沒有內建 layout 功能，這是本專案的替代做法（`renderFront` 傳入的 `layout: 'front'` local 沒有被使用）。render 失敗時直接 `res.status(500).send(err.message)`（不走 errorHandler）。
 
@@ -230,10 +250,11 @@
 | `UNAUTHORIZED` | 401 | `authMiddleware`、`dualAuth`、登入失敗 |
 | `FORBIDDEN` | 403 | `adminMiddleware` |
 | `NOT_FOUND` | 404 | 資源不存在、`/api` 下未知路徑 |
-| `CONFLICT` | 409 | Email 已註冊、刪除仍有 pending 訂單的商品 |
+| `CONFLICT` | 409 | Email 已註冊、刪除仍有 pending 訂單的商品、訂單仍有未到期的 ATM 繳費帳號時再建立綠界付款 |
 | `STOCK_INSUFFICIENT` | 400 | 購物車加入/更新、建立訂單時庫存不足 |
 | `CART_EMPTY` | 400 | 建立訂單時購物車為空 |
 | `INVALID_STATUS` | 400 | 對非 pending 訂單付款 |
+| `PAYMENT_GATEWAY_ERROR` | 502 | `POST /api/orders/:id/ecpay/query`：連不到綠界、HTTP 非 2xx、回應 CheckMacValue 不符，或回應的 `MerchantTradeNo`/`MerchantID` 不是這筆交易。只有訂單 pending 且有 pending 的 `payments` 時才會查詢 |
 | `INTERNAL_ERROR` | 任何（多為 500） | `errorHandler`（**不論狀態碼都固定是這個字串**） |
 
 ### errorHandler 行為（`src/middleware/errorHandler.js`）
@@ -373,9 +394,32 @@
 | `product_price` | INTEGER | NOT NULL | 下單當下單價快照 |
 | `quantity` | INTEGER | NOT NULL | |
 
+### `payments`（綠界付款嘗試）
+
+既有資料庫的升級：`initializeDatabase()` 內的 `migratePaymentsColumns()` 以 `PRAGMA table_info(payments)` 檢查，缺少 `payment_method`、`bank_code`、`v_account`、`expire_date` 時才 `ALTER TABLE ... ADD COLUMN`（冪等，舊資料 `payment_method` 自動為 `'Credit'`）。
+
+| 欄位 | 型別 | 約束 / 預設 | 說明 |
+|------|------|------------|------|
+| `id` | TEXT | PRIMARY KEY | UUID |
+| `order_id` | TEXT | NOT NULL，FK → `orders(id)` | 一筆訂單可有多次付款嘗試 |
+| `merchant_trade_no` | TEXT | UNIQUE NOT NULL | 送給綠界的 `MerchantTradeNo`（20 字元英數） |
+| `amount` | INTEGER | NOT NULL | 建立時的 `orders.total_amount`；回呼的 `TradeAmt` 必須相等才算付款成功 |
+| `status` | TEXT | NOT NULL DEFAULT `'pending'`，CHECK IN (`'pending'`,`'paid'`,`'failed'`) | |
+| `trade_no` | TEXT | 可 NULL | 綠界交易編號 `TradeNo` |
+| `payment_type` | TEXT | 可 NULL | 例：`Credit_CreditCard` |
+| `rtn_code` / `rtn_msg` | TEXT | 可 NULL | paid 列固定為 `'1'` / `'QueryTradeInfo TradeStatus=1'`；回呼失敗列為綠界的 `RtnCode` / `RtnMsg`；金額不符為 `'1'` / `'付款金額與訂單不符'` |
+| `paid_at` | TEXT | 可 NULL | 綠界 `PaymentDate`（台灣時間 `yyyy/MM/dd HH:mm:ss`） |
+| `simulate_paid` | INTEGER | 可 NULL | 非正式環境接受後台模擬付款時為 `1`；經 `confirmPayment()`（QueryTradeInfo）確認的為 NULL |
+| `payment_method` | TEXT | NOT NULL DEFAULT `'Credit'` | `'Credit'`、`'ATM'` 或 `'WebATM'`（由程式的 `PAYMENT_METHODS` 驗證，未加 CHECK，新增付款方式不需改表） |
+| `bank_code` | TEXT | 可 NULL | ATM 銀行代碼（綠界 `BankCode`） |
+| `v_account` | TEXT | 可 NULL | ATM 虛擬帳號（綠界 `vAccount`）；有值且 pending 代表「已取號、待繳費」 |
+| `expire_date` | TEXT | 可 NULL | ATM 繳費期限，原樣保存 `yyyy/MM/dd`（當天 23:59:59 台灣時間截止） |
+| `created_at` | TEXT | NOT NULL DEFAULT `datetime('now')` | |
+
 ### 關聯
 
 ```
+orders 1 ── * payments
 users 1 ── * orders 1 ── * order_items * ‥‥ (無 FK) ‥‥ 1 products
 users 1 ── * cart_items * ── 1 products
 (session_id) 1 ── * cart_items
@@ -410,21 +454,88 @@ POST /api/orders（JWT）
         for 每項: INSERT order_items(快照) + UPDATE products SET stock = stock - qty
         DELETE cart_items WHERE user_id
    ▼
-導向 /orders/:id → 顯示「付款成功 / 付款失敗」按鈕
+導向 /orders/:id → 顯示「信用卡付款」「ATM 轉帳」按鈕（見 8.2）
 ```
 
-### 8.2 付款流程（目前為模擬）
+### 8.2 付款流程（綠界 ECPay AIO：信用卡 + ATM）
+
+核心原則：**回呼只是「去查詢」的通知；只有伺服器主動呼叫綠界 QueryTradeInfo、得到 `TradeStatus=1` 且金額相符時，訂單才會變成 `paid`**（綠界規格亦註明不可依賴 OrderResultURL 判斷付款結果）。唯一例外是非正式環境的後台模擬付款（見下方 ATM 小節）。以下先說明信用卡流程。
 
 ```
-order-detail.js ──PATCH /api/orders/:id/pay { action: 'success' | 'fail' }──▶
-    訂單屬於本人？ 否 → 404
-    status === 'pending'？ 否 → 400 INVALID_STATUS
-    success → status='paid'；fail → status='failed'
-◀── 回傳更新後訂單 + items；前端顯示付款結果提示
+order-detail.js「信用卡付款」
+   │ POST /api/orders/:id/ecpay（JWT）
+   │   訂單屬於本人且 pending → INSERT payments(新 MerchantTradeNo, amount=total_amount)
+   │   回傳 { action_url, merchant_trade_no, params(含 CheckMacValue) }
+   ▼
+瀏覽器以隱藏 form 全頁 POST → payment-stage.ecpay.com.tw/Cashier/AioCheckOut/V5
+   │ 消費者輸入信用卡、3D 驗證
+   ├──▶ ReturnURL  POST /api/ecpay/notify   (綠界 server → 我方；需 BASE_URL 可公開存取)
+   │      驗 CheckMacValue 失敗 ──▶ 0|CheckMacValue Error
+   │      RtnCode≠1 ──▶ applyPaymentResult 記錄失敗 ──▶ 1|OK
+   │      RtnCode=1 ──▶ confirmPayment()
+   │                     ├ paid / failed / not_found ──▶ 1|OK
+   │                     ├ unpaid（TradeStatus≠1）──▶ 0|Not Paid Yet         （綠界稍後重送）
+   │                     └ 查詢失敗 ─────────────▶ 0|QueryTradeInfo Error   （綠界稍後重送）
+   └──▶ OrderResultURL POST /ecpay/result   (消費者瀏覽器帶回；localhost 也可用)
+          驗 CheckMacValue 失敗或查無 payments ──▶ 302 /orders?payment=failed
+          RtnCode≠1 ──▶ 記錄失敗 ──▶ 302 /orders/:id?payment=failed
+          RtnCode=1 ──▶ confirmPayment() ──▶ 302 /orders/:id?payment=success | failed | pending
+   ▼
+order-detail.js
+   ├ ?payment=pending 且訂單 pending ──▶ 每 3 秒 POST /api/orders/:id/ecpay/query，最多 5 次
+   └ 其他 ?payment 且訂單 pending ──▶ 查詢 1 次；另有「重新查詢付款狀態」按鈕
+        POST /api/orders/:id/ecpay/query ──▶ confirmPayment()（失敗 → 502 PAYMENT_GATEWAY_ERROR）
 ```
 
-- 狀態機：`pending → paid` 或 `pending → failed`，兩者皆為終態（`failed` 不能重付、也不會回補庫存）。
-- **ECPay（綠界）整合尚未實作**：`.env.example` 已預留 `ECPAY_MERCHANT_ID`、`ECPAY_HASH_KEY`、`ECPAY_HASH_IV`、`ECPAY_ENV`、`BASE_URL`，程式碼中沒有任何地方讀取它們。前端已預留導回處理：`/orders/:id?payment=success|failed|cancel` 會由 `pageRoutes` 放進 `data-payment-result`，`order-detail.js` 依 `paymentMessages` 顯示提示。若要接金流，預期流程為：建單後由後端產生 ECPay AIO 表單（CheckMacValue 以 HashKey/HashIV 計算）→ 使用者前往綠界付款 → 綠界以 server-to-server `ReturnURL`（需 `BASE_URL` 可公開存取）通知更新 `orders.status` → 使用者以 `OrderResultURL/ClientBackURL` 回到 `/orders/:id?payment=...`。
+**`confirmPayment(merchantTradeNo)`**（`src/services/ecpay.js`，唯一能把訂單標為已付款的路徑）：
+1. 以 `merchant_trade_no` 查 `payments`；查無 → `not_found`；已 `paid` → 直接回 `paid`（**不再查詢**；綠界最多重送 4 次也只處理一次）。
+2. `queryTradeInfo()`：POST `/Cashier/QueryTradeInfo/V5`（form-urlencoded，`TimeStamp` 為 Unix 秒、有效 3 分鐘，附 CheckMacValue）。回應是 URL-encoded 字串，**回應的 CheckMacValue 也必須驗證通過**；HTTP 非 200、網路錯誤、驗證失敗 → 丟出錯誤。
+3. 回應的 `MerchantTradeNo` 或 `MerchantID` 與我方不一致 → 丟出錯誤（防止拿別筆交易的結果冒用）。
+4. `TradeStatus !== '1'` → `unpaid`（`0` 未付款或銀行尚未回覆、`10200095` 交易未成立）。
+5. `TradeStatus === '1'` → `applyPaymentResult()`：transaction 內再核對 `TradeAmt === payments.amount`。相符 → `payments.status='paid'`（記錄 `trade_no`、`payment_type`、`paid_at`，`rtn_msg='QueryTradeInfo TradeStatus=1'`），並 `UPDATE orders SET status='paid' WHERE id=? AND status='pending'`；不符 → `payments.status='failed'`（`rtn_msg='付款金額與訂單不符'`），**訂單維持 `pending`**。
+
+其他重點：
+- 刷卡失敗（回呼 `RtnCode≠1`）只把該筆 `payments` 記為 `failed`，**訂單維持 `pending` 可重新付款**——與舊的模擬付款（`failed` 為終態）不同。
+- 每次點「信用卡付款」或「ATM 轉帳」都產生新的 `MerchantTradeNo`（`FL` + 台灣時間 `yyMMddHHmmss` + 6 碼英數 = 20 字元；綠界規定永久不可重複，現有 `order_no` 含 `-` 不可用）。
+- `MerchantTradeDate` 一律以 UTC+8 產生；`ItemName` 為 `商品名 x 數量` 以 `#` 串接；先移除 HTML、控制字元與 ``#&<>|;`'"``，再截斷至 200 字（空字串時用 `花漾生活商品`），避免綠界截斷造成 CheckMacValue 不符，也避免被 WAF 攔截。
+- 設定：`getConfig()` 每次呼叫時才讀 env（測試與 `.env` 變更都能生效）；未設定 `ECPAY_MERCHANT_ID/HASH_KEY/HASH_IV` 時會改用綠界公開測試帳號，上線前務必設定正式值。`ecpay.js` 會 `require('../database')`，所以載入它就會開啟並初始化 DB。後端使用 Node 內建的 `fetch`，因此需要 **Node 18 以上**。
+- `failed` 的付款列之後仍可能經 `confirmPayment()` 變成 `paid`（`confirmPayment` 只跳過已 `paid` 的列），但查詢 API 只會挑 `pending` 的列。
+- 本機開發：`ReturnURL` 只接受可公開存取的 80/443 埠，`localhost:3001` 收不到；但 `OrderResultURL`（瀏覽器 POST）與 `QueryTradeInfo`（我方主動呼叫）在本機都能運作，因此不需 ngrok 即可完成付款。正式環境請將 `BASE_URL` 設為公開 HTTPS 網址。
+- **回應格式例外**：`/api/ecpay/notify` 依綠界規格回純文字（HTTP 一律 200；只有 `1|OK` 算確認收到，`0|...` 會讓綠界每 5–15 分鐘重送、每日最多 4 次），不是 `{ data, error, message }`；`/ecpay/result` 回 302。這兩個端點無 JWT，真偽由 CheckMacValue（SHA256、`crypto.timingSafeEqual` 比對）驗證。
+- 舊的 `PATCH /api/orders/:id/pay`（模擬付款，`failed` 為終態）仍保留於 API 但前端不再使用。
+- `?payment=success|failed|cancel|pending` 由 `pageRoutes` 放進 `data-payment-result`，`order-detail.js` 依 `paymentMessages` 顯示提示；`ECPAY_ENV` 放進 `data-ecpay-env`，非 production 時顯示測試卡號提示。
+
+#### WebATM（`ChoosePayment=WebATM`）
+
+即時付款，**流程與上面的信用卡完全相同**（OrderResultURL 導回 → `confirmPayment()` → QueryTradeInfo），只是 `ChoosePayment` 不同；沒有專用端點或回呼。綠界規格註明手機不支援（需讀卡機），訂單頁在手機上停用此按鈕，後端不阻擋。詳見 FEATURES 4.7。
+
+#### ATM 虛擬帳號（`ChoosePayment=ATM`）
+
+ATM 是**非同步**付款：先取號（拿到銀行代碼、虛擬帳號、期限），消費者之後才轉帳。
+
+```
+order-detail.js「ATM 轉帳」
+   │ POST /api/orders/:id/ecpay { paymentMethod: 'ATM' }
+   │   有未到期 ATM 帳號 → 409 CONFLICT（不論選哪種方式；ATM 無法用 API 退款，避免重複付款）
+   │   INSERT payments(payment_method='ATM')；params 帶 ExpireDate、PaymentInfoURL、ClientRedirectURL（不帶 OrderResultURL）
+   ▼
+綠界頁面選銀行 →「取得繳費帳號」
+   ├──▶ PaymentInfoURL  POST /api/ecpay/payment-info          （server；需公開網址）
+   │      RtnCode=2 → saveAtmInfo（bank_code、v_account、expire_date）→ 1|OK
+   ├──▶ ClientRedirectURL POST /ecpay/payment-info-result     （瀏覽器；localhost 也可用）
+   │      RtnCode=2 → saveAtmInfo → 302 /orders/:id?payment=atm
+   └──（兩者都沒到時）POST /api/orders/:id/ecpay/query → QueryPaymentInfo 補取號資訊
+   ▼
+訂單頁顯示「ATM 繳費資訊」卡片（付款按鈕隱藏）；消費者轉帳
+   ▼
+ReturnURL POST /api/ecpay/notify（RtnCode=1）→ confirmPayment()（QueryTradeInfo）→ paid
+```
+
+- `saveAtmInfo()` 只更新 `payment_method='ATM'` 且 `status='pending'` 的列，重複通知結果相同（冪等）。ReturnURL 若收到 `RtnCode=2` 也走 `saveAtmInfo`，不會記成失敗。
+- `isAtmActive()`：ATM、pending、有 `v_account`、且台灣時間未超過 `expire_date` 23:59:59。過期後前端顯示「已逾期」並可重新付款；綠界不會通知逾期。
+- **測試環境的付款完成**：ATM 無法真的轉帳，只能在綠界測試後台（`vendor-stage.ecpay.com.tw`，`stagetest3` / `test1234`）對已取號的訂單「模擬付款」。這只會送一個 `SimulatePaid=1` 的 ReturnURL，**不會改變綠界端狀態**（QueryTradeInfo 仍是 0），所以 `ECPAY_ENV≠production` 時 notify 直接以 `applyPaymentResult()` 接受（仍核對金額、記 `simulate_paid=1`，不呼叫 fetch）；正式環境只記 log。需 `BASE_URL` 為公開網址才收得到。
+- 已在綠界測試環境實測：ClientRedirectURL 回到 localhost 正常；QueryPaymentInfo 真實回應 `RtnCode='2'`、`ExpireDate` 為 `yyyy/MM/dd`，CheckMacValue 驗證通過。
+- 訂單詳情（前台 `GET /api/orders/:id`、`/ecpay/query`、後台 `GET /api/admin/orders/:id`）回傳 `payment`：最新一筆付款摘要 `{ payment_method, status, bank_code, v_account, expire_date, is_expired }`（`summarizePayment()`）。
 
 ### 8.3 前端腳本載入與頁面初始化
 

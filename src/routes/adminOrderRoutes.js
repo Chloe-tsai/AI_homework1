@@ -2,6 +2,7 @@ const express = require('express');
 const db = require('../database');
 const authMiddleware = require('../middleware/authMiddleware');
 const adminMiddleware = require('../middleware/adminMiddleware');
+const ecpay = require('../services/ecpay');
 
 const router = express.Router();
 
@@ -181,6 +182,10 @@ router.get('/', (req, res) => {
  *                           type: string
  *                         email:
  *                           type: string
+ *                     payment:
+ *                       type: object
+ *                       nullable: true
+ *                       description: 最新一筆綠界付款摘要（payment_method、status、bank_code、v_account、expire_date、is_expired），同前台訂單詳情
  *                 error:
  *                   type: string
  *                   nullable: true
@@ -199,12 +204,14 @@ router.get('/:id', (req, res) => {
 
   const items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(id);
   const user = db.prepare('SELECT name, email FROM users WHERE id = ?').get(order.user_id);
+  const payment = ecpay.summarizePayment(ecpay.getLatestPayment(id));
 
   res.json({
     data: {
       ...order,
       items,
-      user: user || null
+      user: user || null,
+      payment
     },
     error: null,
     message: '成功'
