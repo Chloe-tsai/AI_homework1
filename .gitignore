@@ -38,3 +38,6 @@ coverage/
 
 .claude/*.local.json
 public/css/output.css
+
+# Third-party agent skills (embedded git repos)
+.agents/skills/ecpay/
